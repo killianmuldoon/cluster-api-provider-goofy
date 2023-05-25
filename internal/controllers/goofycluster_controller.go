@@ -61,7 +61,10 @@ type GoofyClusterReconciler struct {
 // and what is in the GoofyCluster.Spec.
 func (r *GoofyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
 	log := ctrl.LoggerFrom(ctx)
+	log = log.WithValues("GoofyCluster", req.NamespacedName)
+	ctx = ctrl.LoggerInto(ctx, log)
 
+	log.Info("Reconciling")
 	// Fetch the GoofyCluster instance
 	goofyCluster := &infrav1.GoofyCluster{}
 	if err := r.Client.Get(ctx, req.NamespacedName, goofyCluster); err != nil {
@@ -109,7 +112,7 @@ func (r *GoofyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Add finalizer first if not exist to avoid the race condition between init and delete
 	if !controllerutil.ContainsFinalizer(goofyCluster, infrav1.ClusterFinalizer) {
 		controllerutil.AddFinalizer(goofyCluster, infrav1.ClusterFinalizer)
-		return ctrl.Result{}, nil
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Handle deleted clusters

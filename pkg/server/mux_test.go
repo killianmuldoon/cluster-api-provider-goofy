@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -43,6 +45,118 @@ func init() {
 	ctrl.SetLogger(klog.Background())
 }
 
+func TestAPI_corev1_Watch(t *testing.T) {
+	manager := cmanager.New(scheme)
+
+	host := "127.0.0.1"
+	wcmux := NewWorkloadClustersMux(manager, host)
+
+	// InfraCluster controller >> when "creating the load balancer"
+	wcl1 := "workload-cluster1"
+	manager.AddResourceGroup(wcl1)
+
+	listener, err := wcmux.InitWorkloadClusterListener(wcl1)
+	require.NoError(t, err)
+	require.Equal(t, listener.Host(), host)
+	require.NotEmpty(t, listener.Port())
+
+	caCert, caKey, err := newCertificateAuthority()
+	require.NoError(t, err)
+
+	// InfraMachine controller >> when "creating the API Server pod"
+	apiServerPod1 := "kube-apiserver-1"
+	err = wcmux.AddAPIServer(wcl1, apiServerPod1, caCert, caKey)
+	require.NoError(t, err)
+
+	etcdCert, etcdKey, err := newCertificateAuthority()
+	require.NoError(t, err)
+
+	// InfraMachine controller >> when "creating the Etcd member pod"
+	etcdPodMember1 := "etcd-1"
+	err = wcmux.AddEtcdMember(wcl1, etcdPodMember1, etcdCert, etcdKey)
+	require.NoError(t, err)
+
+	// Test API using a controller runtime client to call IT
+	c, err := listener.GetClient()
+	require.NoError(t, err)
+
+	config, err := listener.RESTConfig()
+	require.NoError(t, err)
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	ctx := context.Background()
+	// GET ENDPOINTS RESOURCE VERSION
+	nodeClient := clientset.CoreV1().Nodes()
+	nodeList, err := nodeClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		panic(err.Error())
+	}
+	resourceVersion := nodeList.ListMeta.ResourceVersion
+
+	// SETUP WATCHER CHANNEL
+	watcher, err := nodeClient.Watch(ctx, metav1.ListOptions{ResourceVersion: resourceVersion})
+	if err != nil {
+		panic(err.Error())
+	}
+	ch := watcher.ResultChan()
+
+	// LISTEN TO CHANNEL
+	go func() {
+		for {
+			event := <-ch
+			_, ok := event.Object.(*corev1.Node)
+			if !ok {
+				fmt.Printf("Could not cast to Node")
+			}
+		}
+	}()
+
+	// create
+	nc := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+	}
+	err = c.Create(ctx, nc)
+	require.NoError(t, err)
+
+	// list
+
+	nl := &corev1.NodeList{}
+	err = c.List(ctx, nl)
+	require.NoError(t, err)
+
+	// get
+
+	n := &corev1.Node{}
+	err = c.Get(ctx, client.ObjectKey{Name: "foo"}, n)
+	require.NoError(t, err)
+
+	// patch
+
+	n2 := n.DeepCopy()
+	n2.Annotations = map[string]string{"foo": "bar"}
+	err = c.Patch(ctx, n2, client.MergeFrom(n))
+	require.NoError(t, err)
+
+	n3 := n2.DeepCopy()
+	taints := []corev1.Taint{}
+	for _, taint := range n.Spec.Taints {
+		if taint.Key == "foo" {
+			continue
+		}
+		taints = append(taints, taint)
+	}
+	n3.Spec.Taints = taints
+	err = c.Patch(ctx, n3, client.StrategicMergeFrom(n2))
+	require.NoError(t, err)
+
+	// delete
+
+	err = c.Delete(ctx, n)
+	require.NoError(t, err)
+}
 func TestAPI_corev1_CRUD(t *testing.T) {
 	manager := cmanager.New(scheme)
 

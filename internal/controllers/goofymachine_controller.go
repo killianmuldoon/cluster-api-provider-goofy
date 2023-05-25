@@ -71,6 +71,10 @@ type GoofyMachineReconciler struct {
 // and what is in the GoofyMachine.Spec.
 func (r *GoofyMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
 	log := ctrl.LoggerFrom(ctx)
+	log = log.WithValues("GoofyMachine", req.NamespacedName)
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	log.Info("Reconciling")
 
 	// Fetch the GoofyMachine instance
 	goofyMachine := &infrav1.GoofyMachine{}
@@ -81,7 +85,7 @@ func (r *GoofyMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// AddOwners adds the owners of DockerMachine as k/v pairs to the logger.
+	// AddOwners adds the owners of GoofyMachine as k/v pairs to the logger.
 	// Specifically, it will add KubeadmControlPlane, MachineSet and MachineDeployment.
 	ctx, log, err := clog.AddOwners(ctx, r.Client, goofyMachine)
 	if err != nil {
@@ -491,7 +495,7 @@ func (r *GoofyMachineReconciler) SetupWithManager(ctx context.Context, mgr ctrl.
 		).
 		Watches(
 			&clusterv1.Cluster{},
-			handler.EnqueueRequestsFromMapFunc(util.ClusterToInfrastructureMapFunc(ctx, infrav1.GroupVersion.WithKind("GoofyMachine"), mgr.GetClient(), &infrav1.GoofyCluster{})),
+			handler.EnqueueRequestsFromMapFunc(util.ClusterToInfrastructureMapFunc(ctx, infrav1.GroupVersion.WithKind("GoofyCluster"), mgr.GetClient(), &infrav1.GoofyCluster{})),
 			builder.WithPredicates(
 				predicates.ClusterUnpaused(ctrl.LoggerFrom(ctx)),
 			),

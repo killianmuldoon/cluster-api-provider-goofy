@@ -8,6 +8,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
+	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/watch"
+
+	cclient "github.com/fabriziopandini/cluster-api-provider-goofy/pkg/cloud/runtime/client"
+
 	"github.com/emicklei/go-restful/v3"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -143,6 +149,11 @@ func (h *apiServerHandler) apisDiscovery(req *restful.Request, resp *restful.Res
 	}
 }
 
+func (h *apiServerHandler) apiV1Watch(req *restful.Request, resp *restful.Response) {
+	// Watch opens a long-running connection that returns a stream of events to the connection.
+
+}
+
 func (h *apiServerHandler) apiV1Create(req *restful.Request, resp *restful.Response) {
 	ctx := req.Request.Context()
 
@@ -206,10 +217,21 @@ func (h *apiServerHandler) apiV1List(req *restful.Request, resp *restful.Respons
 	// Gets at client to the resource group.
 	cloudClient := h.manager.GetResourceGroup(resourceGroup).GetClient()
 
+	h.log.Info(fmt.Sprintf("[DEBUG] Serving List for %v", req.Request.URL))
+
 	// Maps the requested resource to a gvk.
 	gvk, err := requestToGVK(req)
 	if err != nil {
 		_ = resp.WriteErrorString(http.StatusInternalServerError, err.Error())
+		return
+	}
+	// If the request is for a watch it will be handled separately.
+	if isWatch(req) {
+		err = h.watchForResource(ctx, cloudClient, *gvk, resourceGroup, req, resp)
+		if err != nil {
+			_ = resp.WriteErrorString(http.StatusInternalServerError, err.Error())
+			return
+		}
 		return
 	}
 
@@ -507,4 +529,168 @@ func getAPIResourceList(req *restful.Request) *metav1.APIResourceList {
 		return nil
 	}
 	return corev1APIResourceList
+}
+
+func isWatch(req *restful.Request) bool {
+	return req.QueryParameter("watch") == "true"
+}
+
+func (h *apiServerHandler) watchForResource(ctx context.Context, cloudClient cclient.Client, gvk schema.GroupVersionKind, resourceGroup string, req *restful.Request, resp *restful.Response) error {
+	c := h.manager.GetCache()
+	i, err := c.GetInformerForKind(ctx, gvk)
+	if err != nil {
+		return err
+	}
+	h.log.Info(fmt.Sprintf("[DEBUG] Serving Watch for %v", req.Request.URL))
+	events := make(chan *watch.Event)
+	watcher := &WatchEventDispatcher{
+		resourceGroup: resourceGroup,
+		events:        events,
+	}
+
+	if err := i.AddEventHandler(watcher); err != nil {
+		return err
+	}
+	watcher.Run(*req.Request, gvk, resp, h)
+	return nil
+}
+
+type WatchEventDispatcher struct {
+	resourceGroup string
+	events        chan (*watch.Event)
+}
+
+func (m *WatchEventDispatcher) OnCreate(resourceGroup string, o client.Object) {
+	if resourceGroup != m.resourceGroup {
+		return
+	}
+	m.events <- &watch.Event{
+		Type:   watch.Added,
+		Object: o,
+	}
+}
+
+func (m *WatchEventDispatcher) OnUpdate(resourceGroup string, old, new client.Object) {
+	if resourceGroup != m.resourceGroup {
+		return
+	}
+	m.events <- &watch.Event{
+		Type:   watch.Modified,
+		Object: new,
+	}
+}
+
+func (m *WatchEventDispatcher) OnDelete(resourceGroup string, o client.Object) {
+	if resourceGroup != m.resourceGroup {
+		return
+	}
+	m.events <- &watch.Event{
+		Type:   watch.Deleted,
+		Object: o,
+	}
+}
+
+func (m *WatchEventDispatcher) OnGeneric(resourceGroup string, o client.Object) {
+	if resourceGroup != m.resourceGroup {
+		return
+	}
+	m.events <- &watch.Event{
+		Type:   watch.EventType("GENERIC"),
+		Object: o,
+	}
+}
+
+// Run serves a series of encoded events via HTTP with Transfer-Encoding: chunked
+// or over a websocket connection.
+func (m *WatchEventDispatcher) Run(req http.Request, gvk schema.GroupVersionKind, w http.ResponseWriter, h *apiServerHandler) {
+	h.log.Info(fmt.Sprintf("[DEBUG] Starting a watch %v", req))
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		fmt.Printf("unable to start watch - can't get http.Flusher: %#v", w)
+		return
+	}
+	resp, ok := w.(*restful.Response)
+	if !ok {
+		fmt.Printf("unable to start watch - can't get restfule.Response: %#v", w)
+		return
+	}
+	//TODO: Add timeout
+	// begin the stream
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	var unknown runtime.Unknown
+
+	//var unknown runtime.Unknown
+	//internalEvent := &metav1.InternalEvent{}
+	//outEvent := &metav1.WatchEvent{}
+	//buf := []byte{}
+	done := req.Context().Done()
+
+	//codecs := serializer.NewCodecFactory(scheme.Scheme)
+	//info, match := runtime.SerializerInfoForMediaType(codecs.SupportedMediaTypes(), "application/json")
+	//if !match {
+	//	panic("failed to get SerializerInfo for application/yaml")
+	//}
+	//
+	//encoder := codecs.EncoderForVersion(info.Serializer, gvk.GroupVersion())
+	//e := streaming.NewEncoder(resp, encoder)
+	for {
+		select {
+		case <-done:
+			return
+		case event, ok := <-m.events:
+			h.log.Info(fmt.Sprintf("[DEBUG] Writing event %v", spew.Sprint(event)))
+			if !ok {
+				// End of results.
+				return
+			}
+			b, err := json.Marshal(event.Object)
+			if err != nil {
+				panic(0)
+			}
+			unknown.Raw = b
+
+			event.Object = &unknown
+			if err := resp.WriteEntity(event.Object); err != nil {
+				_ = resp.WriteErrorString(http.StatusInternalServerError, err.Error())
+				return
+			}
+			if len(m.events) == 0 {
+				flusher.Flush()
+			}
+
+			//if err = e.Encode(event.Object); err != nil {
+			//	// unexpected error
+			//	fmt.Printf("unable to encode watch object %T: %v", event.Object, err)
+			//	return
+			//}
+			//
+			//// ContentType is not required here because we are defaulting to the serializer
+			//// type
+			//unknown.Raw = buf
+			//event.Object = &unknown
+			//
+			//*outEvent = metav1.WatchEvent{}
+			//
+			//// create the external type directly and encode it.  Clients will only recognize the serialization we provide.
+			//// The internal event is being reused, not reallocated so its just a few extra assignments to do it this way
+			//// and we get the benefit of using conversion functions which already have to stay in sync
+			//*internalEvent = metav1.InternalEvent(*event)
+			//err := metav1.Convert_v1_InternalEvent_To_v1_WatchEvent(internalEvent, outEvent, nil)
+			//if err != nil {
+			//	fmt.Printf("unable to convert watch object: %v", err)
+			//	// client disconnect.
+			//	return
+			//}
+			//if err := e.Encode(outEvent); err != nil {
+			//	fmt.Printf("unable to encode watch object %T: %v", outEvent, err)
+			//	// client disconnect.
+			//	return
+			//}
+			//buf = []byte{}
+		}
+	}
 }
